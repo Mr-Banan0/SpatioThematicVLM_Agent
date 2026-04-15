@@ -6,25 +6,46 @@ from datetime import datetime
 import torch
 import time
 import pprint
-
+import logging
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
-from fpdf import FPDF
+import requests
 
-# ==================== Qwen2.5-VL Model Loading ====================
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
+
+# Qwen2.5-VL Model Loading
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 from qwen_vl_utils import process_vision_info
-
 MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
+_model = None
+_processor = None
 
-print("=== Loading Qwen2.5-VL-7B model...===")
-model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    MODEL_NAME, torch_dtype="auto", device_map="auto", trust_remote_code=True
-)
-processor = AutoProcessor.from_pretrained(
-    MODEL_NAME, trust_remote_code=True,
-    min_pixels=256 * 28 * 28, max_pixels=1280 * 28 * 28,
-)
-print("=== Model loaded successfully ===\n")
+# model and processor Lazy Loading
+def get_model_and_processor():
+    global _model, _processor
+    if _model is None:
+        logger.info("=== First loading Qwen2.5-VL-7B-Instruct ===")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            MODEL_NAME,
+            torch_dtype="auto",
+            device_map="cuda",
+            trust_remote_code=True,
+            quantization_config=quantization_config,
+        )
+        _processor = AutoProcessor.from_pretrained(
+            MODEL_NAME, trust_remote_code=True,
+            min_pixels=256*28*28, max_pixels=1280*28*28,
+        )
+        logger.info("=== model loaded successfully ===")
+    return _model, _processor
 
 # ====================== Pydantic Models ======================
 class VisualElement(BaseModel):
@@ -56,15 +77,17 @@ class Anomaly(BaseModel):
     severity: str = Field("medium", description="Severity level: low/medium/high")
 
 class AgentState(TypedDict):
-    map_image: str
-    visual_features: Dict[str, Any]          # 存 VisualFeatures.model_dump()
-    semantic_themes: Dict[str, Any]          # 存 SemanticThemes.model_dump()
-    anomalies: List[Dict[str, Any]]          # 存 Anomaly.model_dump()
+    map_image: str               
+    shp_zip_path: Optional[str]   
+    gis_metadata: Dict[str, Any]     
+    visual_features: Dict[str, Any]
+    semantic_themes: Dict[str, Any]
+    geographic_insights: Dict[str, Any]
+    anomalies: List[Dict[str, Any]]
     next: str
     analysis_steps: List[str]
     report_markdown: str
     pdf_path: Optional[str]
-
 
 def _extract_and_validate_json(raw_response: str, model_class: type[BaseModel]) -> BaseModel:
     print("=== [Pydantic Parser] RAW RESPONSE ===")
@@ -126,6 +149,7 @@ def call_vlm(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[call_vlm] Using device: {device}")
 
+    model, processor = get_model_and_processor()
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
@@ -151,10 +175,10 @@ def call_vlm(
 
     generated_ids = model.generate(
         **inputs,
-        max_new_tokens=1024,
-        temperature=0.7,
+        max_new_tokens=512,
+        temperature=0.6,
         do_sample=True,
-        top_p=0.9,
+        top_p=0.85,
     )
 
     generated_ids_trimmed = [
@@ -179,20 +203,13 @@ def supervisor_node(state: AgentState) -> Dict:
     print("=== [Supervisor Node] START ===")
     start = time.time()
 
-    if state.get("report_markdown") or state.get("pdf_path"):
+    if "raw_gis_path" in state and "map_image" not in state:
+        next_node = "gis_preprocessor"
+    elif state.get("report_markdown") or state.get("pdf_path"):
         next_node = "END"
-        state.setdefault("analysis_steps", []).append(
-            f"[{datetime.now().strftime('%H:%M:%S')}] Supervisor → END (Report already generated)"
-        )
-        print(f"=== [Supervisor Node] FINISH → Next: {next_node} (Report already generated) ===\n")
-        return {"next": next_node, "analysis_steps": state["analysis_steps"]}
-
-    visual = state.get("visual_features", {})
-    semantic = state.get("semantic_themes", {})
-
-    if not visual or not visual.get("analysis_complete", False):
+    elif not state.get("visual_features", {}).get("analysis_complete", False):
         next_node = "visual_agent"
-    elif not semantic or not semantic.get("analysis_complete", False):
+    elif not state.get("semantic_themes", {}).get("analysis_complete", False):
         next_node = "semantic_agent"
     elif "anomalies" not in state or state.get("anomalies") is None:
         next_node = "anomaly_agent"
@@ -206,6 +223,54 @@ def supervisor_node(state: AgentState) -> Dict:
     print(f"=== [Supervisor Node] FINISH → Next: {next_node} (took {time.time()-start:.2f}s) ===\n")
     return {"next": next_node, "analysis_steps": state["analysis_steps"]}
 
+def gis_preprocessor_node(state: AgentState) -> Dict:
+    """使用 ArcPy 服务把 tif / shp 转为 PNG + 提取真实 GIS 元数据"""
+    print("=== [GIS Preprocessor Node] START ===")
+    start = time.time()
+
+    raw_path = state["raw_gis_path"]
+    print(f"正在预处理文件: {raw_path}")
+
+    try:
+        files = {"file": open(raw_path, "rb")}
+        resp = requests.post("http://localhost:8002/preprocess", files=files, timeout=90)
+        
+        print(f"预处理服务返回状态码: {resp.status_code}")
+        print(f"预处理服务返回内容: {resp.text[:800]}...")   # ← 调试用
+
+        if resp.status_code != 200:
+            raise Exception(f"预处理服务错误: {resp.text}")
+
+        data = resp.json()
+
+        # 安全获取 metadata
+        metadata = data.get("gis_metadata", {})
+        preview_png = data.get("preview_png")
+
+        if not preview_png:
+            raise Exception("预处理服务未返回 preview_png")
+
+        # 更新 state
+        state["map_image"] = preview_png
+        state["gis_metadata"] = metadata
+
+        # 安全显示类型
+        file_type = metadata.get("type", "image")   # ← 防止 KeyError
+
+        state.setdefault("analysis_steps", []).append(
+            f"[{datetime.now().strftime('%H:%M:%S')}] GIS Preprocessor 完成 (类型: {file_type})"
+        )
+
+        print(f"=== [GIS Preprocessor] FINISH (类型: {file_type}) (took {time.time()-start:.2f}s) ===\n")
+        return {
+            "map_image": preview_png,
+            "gis_metadata": metadata,
+            "analysis_steps": state["analysis_steps"]
+        }
+
+    except Exception as e:
+        print(f"❌ GIS Preprocessor 失败: {e}")
+        raise
 
 # ====================== 2. Visual Agent ======================
 def visual_agent_node(state: AgentState) -> Dict:
@@ -219,10 +284,12 @@ def visual_agent_node(state: AgentState) -> Dict:
     )
     # check schema_str
     # print(f"=== [Visual Agent] Schema for VisualFeatures ===\n{schema_str}\n")
-
+    shp_info = ""
+    if state.get("gis_metadata"):
+        shp_info = f"\nAdditional GIS Data from Shapefile:\n{json.dumps(state['gis_metadata'], ensure_ascii=False, indent=2)}"
     system_prompt = (
-        "You are a professional cartographer and visual analysis expert (Layer 1).\n"
-        "Analyze the thematic map and return data strictly following this schema:\n"
+        "You are a professional cartographer and visual analysis expert.\n"
+        "Analyze the thematic map image and the provided GIS metadata...\n"
         f"{schema_str}\n\n"
         "CRITICAL RULES:\n"
         "1. Return ONLY valid JSON, nothing else — no explanations, no markdown, no ```json, no extra text.\n"
@@ -230,7 +297,7 @@ def visual_agent_node(state: AgentState) -> Dict:
         "3. Do not add any extra fields.\n"
         "4. Output must be parseable by Pydantic immediately."
     )
-    user_prompt = "Please analyze the visual elements of this thematic map."
+    user_prompt = f"Please analyze the visual elements of this thematic map.{shp_info}"
 
     response = call_vlm(system_prompt, user_prompt, state["map_image"])
 
@@ -261,6 +328,9 @@ def semantic_agent_node(state: AgentState) -> Dict:
         ensure_ascii=False,
         indent=2
     )
+    shp_info = ""
+    if state.get("gis_metadata"):
+        shp_info = f"\nAdditional GIS Data from Shapefile:\n{json.dumps(state['gis_metadata'], ensure_ascii=False, indent=2)}"
     # check schema_str
     # print(f"=== [Semantic Agent] Schema for SemanticThemes ===\n{schema_str}\n")
     system_prompt = (
@@ -281,6 +351,7 @@ def semantic_agent_node(state: AgentState) -> Dict:
     user_prompt = (
         f"Visual features:\n{json.dumps(state.get('visual_features', {}), ensure_ascii=False, indent=2)}\n"
         "Please map these to semantic and thematic interpretations."
+        f"{shp_info}"
     )
 
     response = call_vlm(system_prompt, user_prompt, state["map_image"])
@@ -349,107 +420,100 @@ def anomaly_agent_node(state: AgentState) -> Dict:
 
 # ====================== 5. Report Generator Agent ======================
 def report_agent_node(state: AgentState) -> Dict:
-    """Generate a professional, comprehensive geographic analysis report in natural language."""
+    """Generate a professional, comprehensive geographic analysis report in Markdown format.
+    Optimized with dynamic fallback that works for any thematic map."""
     print("=== [Report Agent] START ===")
     start = time.time()
 
-    # 提取已有分析结果
+    # Extract results from previous agents
     visual = state.get("visual_features", {})
     semantic = state.get("semantic_themes", {})
     anomalies = state.get("anomalies", [])
 
-    # ==================== 使用 LLM 生成专业报告 ====================
+    shp_info = ""
+    if state.get("gis_metadata"):
+        shp_info = f"\nAdditional GIS Data from Shapefile:\n{json.dumps(state['gis_metadata'], ensure_ascii=False, indent=2)}"
+    # ==================== Optimized System Prompt ====================
     system_prompt = (
         "You are a senior geographic information scientist and environmental analyst.\n"
         "Write a professional, comprehensive, and well-structured geographic analysis report.\n"
-        "Use formal academic tone, natural paragraphs, and smooth transitions.\n"
-        "Do NOT output any JSON code blocks.\n"
-        "Focus on interpretation and insights rather than raw data."
+        "Requirements:\n"
+        "1. Use formal academic tone with natural paragraphs and smooth transitions.\n"
+        "2. Strictly use Markdown format with clear headings (#, ##, ###).\n"
+        "3. Focus on geographic significance, spatial patterns, and environmental insights.\n"
+        "4. Do NOT output any JSON, code blocks, or explanatory text — only the final report.\n"
+        "5. Keep the report in-depth but concise."
     )
 
-    user_prompt = f"""Analyze the following results and write a professional geographic analysis report.
+    # ==================== User Prompt ====================
+    user_prompt = f"""Analyze the following analysis results and generate a complete geographic analysis report.{shp_info}
+    Visual Features:
+    {json.dumps(visual, ensure_ascii=False, indent=2)}
 
-Visual Features:
-{json.dumps(visual, ensure_ascii=False, indent=2)}
+    Semantic Themes:
+    {json.dumps(semantic, ensure_ascii=False, indent=2)}
 
-Semantic Themes:
-{json.dumps(semantic, ensure_ascii=False, indent=2)}
+    Detected Anomalies:
+    {json.dumps(anomalies, ensure_ascii=False, indent=2)}
 
-Anomalies Detected:
-{json.dumps(anomalies, ensure_ascii=False, indent=2)}
+    Please generate a well-structured Markdown report that includes the following sections:
+    - Main Title (using #)
+    - Executive Summary
+    - Visual Interpretation
+    - Spatial Patterns and Geographic Significance
+    - Key Insights and Implications
+    - Anomaly Analysis (if any)
+    - Conclusion and Recommendations
 
-Please generate a coherent, in-depth geographic analysis report in Markdown format.
-Include:
-- Overall map interpretation
-- Environmental quality assessment
-- Spatial patterns and geographic significance
-- Key insights and implications
-- Any anomalies (or note if none were found)
+    Use professional yet readable language. Emphasize geographic meaning and environmental implications."""
 
-Use natural language and professional tone. Do not include raw JSON."""
-
-    # 调用 VLM 生成高质量报告
+    # Call VLM to generate the report
     markdown = call_vlm(system_prompt, user_prompt, state.get("map_image"))
 
-    # 如果 LLM 输出为空或出错， fallback 到简单模板
-    if not markdown or len(markdown.strip()) < 50:
-        markdown = f"""# SpatioThematicVLM Geographic Analysis Report
-**Generation Time**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    # ==================== Fallback ====================
+    if not markdown or len(markdown.strip()) < 100:
+        # Try to extract useful information dynamically
+        map_title = visual.get("map_title") or visual.get("theme") or "Thematic Map"
+        main_theme = semantic.get("main_theme") or "Geographic Analysis"
+        geo_meaning = semantic.get("geographic_meaning") or "Spatial patterns and environmental insights are presented."
 
-## Executive Summary
-The thematic map shows environmental quality (RSEI) across Guangdong Province. The analysis indicates generally high environmental quality with limited spatial variation.
+        markdown = f"""# {map_title} Analysis Report
+        **Generation Time**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        **Analysis Model**: Qwen2.5-VL-7B
 
-## Visual Interpretation
-{visual.get('overall_summary', 'No visual summary available.')}
+        ## Executive Summary
+        This thematic map presents {main_theme.lower()}. The analysis reveals important spatial patterns and geographic significance.
 
-## Semantic and Geographic Insights
-{semantic.get('main_theme', '')}  
-{semantic.get('geographic_meaning', '')}
+        ## Visual Interpretation
+        {visual.get('overall_summary', 'No visual summary available.')}
 
-Key spatial patterns include: {', '.join(semantic.get('spatial_patterns', [])) or 'None identified.'}
+        ## Spatial Patterns and Geographic Significance
+        {main_theme}  
+        {geo_meaning}
 
-## Key Insights
-{chr(10).join(['- ' + insight for insight in semantic.get('key_insights', [])]) or 'No additional insights.'}
+        ## Key Insights
+        {chr(10).join(['- ' + insight for insight in semantic.get('key_insights', [])]) or 'No additional insights identified.'}
 
-## Anomaly Detection
-{"No spatial anomalies were detected." if not anomalies else "The following anomalies were identified:"}
-{chr(10).join(['- ' + a.get('description', '') for a in anomalies]) if anomalies else ''}
+        ## Anomaly Analysis
+        {"No significant spatial anomalies were detected." if not anomalies else "The following spatial anomalies were identified:"}
+        {chr(10).join(['- ' + a.get('description', '') for a in anomalies]) if anomalies else ''}
 
-## Conclusion
-Guangdong Province demonstrates strong overall environmental quality based on the RSEI index.
-"""
+        ## Conclusion and Recommendations
+        The map demonstrates notable geographic characteristics. Further investigation and appropriate measures are recommended based on the identified patterns and anomalies.
+        """
+    # =====================================================================
 
     state["report_markdown"] = markdown
 
-    # ==================== 生成 PDF ====================
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.set_font("Arial", size=11)
-
-    for line in markdown.split("\n"):
-        pdf.multi_cell(0, 6, line.encode("latin-1", "replace").decode("latin-1"))
-        if pdf.get_y() > 270:
-            pdf.add_page()
-
-    output_dir = "outputs"
-    os.makedirs(output_dir, exist_ok=True)
-    pdf_path = os.path.join(
-        output_dir,
-        f"thematic_map_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    )
-    pdf.output(pdf_path)
-
-    state["pdf_path"] = pdf_path
     state.setdefault("analysis_steps", []).append(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Professional geographic analysis report generated: {pdf_path}"
+        f"[{datetime.now().strftime('%H:%M:%S')}] Markdown report generated successfully"
     )
 
     print(f"=== [Report Agent] FINISH (took {time.time()-start:.2f}s) ===\n")
 
     return {
         "report_markdown": markdown,
-        "pdf_path": pdf_path,
+        "pdf_path": None,
         "analysis_steps": state["analysis_steps"],
         "next": "END"
     }

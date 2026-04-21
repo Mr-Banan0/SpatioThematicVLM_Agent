@@ -22,6 +22,20 @@ MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
 _model = None
 _processor = None
 
+VLM_GENERATION_CONFIG = {
+    "temperature": 0.6,
+    "top_p": 0.85,
+    "max_new_tokens": 512,
+}
+
+_vlm_call_log: list = []
+
+def get_vlm_call_log() -> list:
+    return _vlm_call_log
+
+def clear_vlm_call_log():
+    _vlm_call_log.clear()
+
 # model and processor Lazy Loading
 def get_model_and_processor():
     global _model, _processor
@@ -140,6 +154,7 @@ def call_vlm(
     system_prompt: str,
     user_prompt: str,
     image_path: Optional[str] = None,
+    **generation_kwargs,
 ) -> str:
     """Call Qwen2.5-VL with timing and debug prints."""
     start_time = time.time()
@@ -173,12 +188,13 @@ def call_vlm(
         return_tensors="pt",
     ).to(device)
 
+    _gen_config = {**VLM_GENERATION_CONFIG, **generation_kwargs}
     generated_ids = model.generate(
         **inputs,
-        max_new_tokens=512,
-        temperature=0.6,
-        do_sample=True,
-        top_p=0.85,
+        max_new_tokens=_gen_config["max_new_tokens"],
+        temperature=_gen_config["temperature"],
+        do_sample=_gen_config["temperature"] > 0,
+        top_p=_gen_config["top_p"],
     )
 
     generated_ids_trimmed = [
@@ -196,6 +212,12 @@ def call_vlm(
     print(f"[call_vlm] FINISH - Duration: {duration:.2f} seconds")
     print(f"[call_vlm] Output length: {len(output_text)}\n")
 
+    _vlm_call_log.append({
+        "output": output_text.strip(),
+        "duration": duration,
+        "image_path": image_path,
+        "config": _gen_config,
+    })
     return output_text.strip()
 
 # ====================== 1. Supervisor Node ======================

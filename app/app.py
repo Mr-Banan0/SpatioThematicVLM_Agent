@@ -9,42 +9,48 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 import requests
 
-# import nodes
-from app.nodes import AgentState, supervisor_node, visual_agent_node, semantic_agent_node, anomaly_agent_node, report_agent_node, gis_preprocessor_node
+from app.nodes import AgentState, supervisor_node, gis_tool_agent_node, visual_agent_node, semantic_agent_node, anomaly_agent_node, report_agent_node, gis_preprocessor_node
+
 # build app
-load_dotenv()  # Load environment variables from .env file ----NOTYET
+load_dotenv()
 app = FastAPI(title="SpatioThematicVLM Enterprise", version="0.1.0")
 
 # define workflow
 workflow = StateGraph(AgentState)
+
 workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("gis_preprocessor", gis_preprocessor_node)
 workflow.add_node("visual_agent", visual_agent_node)
 workflow.add_node("semantic_agent", semantic_agent_node)
 workflow.add_node("anomaly_agent", anomaly_agent_node)
 workflow.add_node("report_agent", report_agent_node)
-
+workflow.add_node("gis_tool_agent", gis_tool_agent_node)
 workflow.add_edge(START, "supervisor")
+
+# True conditional routing from supervisor
 workflow.add_conditional_edges(
     "supervisor",
-    lambda s: s["next"],
+    lambda s: s["next"], 
     {
         "gis_preprocessor": "gis_preprocessor",
         "visual_agent": "visual_agent",
         "semantic_agent": "semantic_agent",
         "anomaly_agent": "anomaly_agent",
         "report_agent": "report_agent",
+        "gis_tool_agent": "gis_tool_agent",
         "END": END,
     }
 )
-for node in ["gis_preprocessor", "visual_agent", "semantic_agent", "anomaly_agent", "report_agent"]:
+
+for node in ["gis_preprocessor", "visual_agent", "semantic_agent", "anomaly_agent", "report_agent","gis_tool_agent"]:
     workflow.add_edge(node, "supervisor")
+
 graph = workflow.compile(checkpointer=MemorySaver())
 
 @app.post("/analyze")
 async def analyze_map(
-    image_file: UploadFile = File(..., description="必填：已做好的专题地图图片 (PNG/JPG)"),
-    shp_zip: UploadFile = File(None, description="可选：shp 的 zip 压缩包")
+    image_file: UploadFile = File(..., description="必填:已做好的专题地图图片 (PNG/JPG)"),
+    shp_zip: UploadFile = File(None, description="可选:shp 的 zip 压缩包")
 ):
     ext = image_file.filename.lower()
     if not ext.endswith(('.png', '.jpg', '.jpeg')):
@@ -52,7 +58,6 @@ async def analyze_map(
 
     os.makedirs("uploads", exist_ok=True)
     image_path = f"uploads/{image_file.filename}"
-    
     with open(image_path, "wb") as f:
         f.write(await image_file.read())
 
@@ -69,7 +74,13 @@ async def analyze_map(
 
     initial_state = {
         "map_image": image_path,
-        "shp_zip_path": shp_path 
+        "shp_zip_path": shp_path,
+        "gis_metadata": None,
+        "tool_results": None,
+        "visual_features": None,
+        "semantic_themes": None,
+        "anomalies": None,
+        "report_markdown": None
     }
 
     final_state = await graph.ainvoke(
@@ -91,6 +102,6 @@ async def analyze_map(
     }
 
 # start app
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

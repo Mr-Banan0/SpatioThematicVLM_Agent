@@ -9,42 +9,52 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 import requests
 
-# import nodes
-from app.nodes import AgentState, supervisor_node, visual_agent_node, semantic_agent_node, anomaly_agent_node, report_agent_node, gis_preprocessor_node
+from app.nodes import call_vlm, get_model_and_processor, AgentState, supervisor_node, gis_tool_agent_node, visual_agent_node, semantic_agent_node, anomaly_agent_node, report_agent_node, gis_preprocessor_node
+
 # build app
-load_dotenv()  # Load environment variables from .env file ----NOTYET
+load_dotenv()
 app = FastAPI(title="SpatioThematicVLM Enterprise", version="0.1.0")
 
 # define workflow
 workflow = StateGraph(AgentState)
+
 workflow.add_node("supervisor", supervisor_node)
 workflow.add_node("gis_preprocessor", gis_preprocessor_node)
 workflow.add_node("visual_agent", visual_agent_node)
 workflow.add_node("semantic_agent", semantic_agent_node)
 workflow.add_node("anomaly_agent", anomaly_agent_node)
 workflow.add_node("report_agent", report_agent_node)
-
+workflow.add_node("gis_tool_agent", gis_tool_agent_node)
 workflow.add_edge(START, "supervisor")
+
+# True conditional routing from supervisor
 workflow.add_conditional_edges(
     "supervisor",
-    lambda s: s["next"],
+    lambda s: s["next"], 
     {
         "gis_preprocessor": "gis_preprocessor",
         "visual_agent": "visual_agent",
         "semantic_agent": "semantic_agent",
         "anomaly_agent": "anomaly_agent",
         "report_agent": "report_agent",
+        "gis_tool_agent": "gis_tool_agent",
         "END": END,
     }
 )
-for node in ["gis_preprocessor", "visual_agent", "semantic_agent", "anomaly_agent", "report_agent"]:
+
+for node in ["gis_preprocessor", "visual_agent", "semantic_agent", "anomaly_agent", "report_agent","gis_tool_agent"]:
     workflow.add_edge(node, "supervisor")
+
 graph = workflow.compile(checkpointer=MemorySaver())
+
+print("=== [Startup] Preloading Qwen2.5-VL model for faster chat ===")
+get_model_and_processor()
+print("=== [Startup] Model preloaded successfully ===")
 
 @app.post("/analyze")
 async def analyze_map(
-    image_file: UploadFile = File(..., description="必填：已做好的专题地图图片 (PNG/JPG)"),
-    shp_zip: UploadFile = File(None, description="可选：shp 的 zip 压缩包")
+    image_file: UploadFile = File(..., description="Required: thematic map image (PNG/JPG)"),
+    shp_zip: UploadFile = File(None, description="Optional: shp zip archive")
 ):
     ext = image_file.filename.lower()
     if not ext.endswith(('.png', '.jpg', '.jpeg')):
@@ -52,7 +62,6 @@ async def analyze_map(
 
     os.makedirs("uploads", exist_ok=True)
     image_path = f"uploads/{image_file.filename}"
-    
     with open(image_path, "wb") as f:
         f.write(await image_file.read())
 
@@ -69,7 +78,13 @@ async def analyze_map(
 
     initial_state = {
         "map_image": image_path,
-        "shp_zip_path": shp_path 
+        "shp_zip_path": shp_path,
+        "gis_metadata": None,
+        "tool_results": None,
+        "visual_features": None,
+        "semantic_themes": None,
+        "anomalies": None,
+        "report_markdown": None
     }
 
     final_state = await graph.ainvoke(
@@ -90,7 +105,60 @@ async def analyze_map(
         "message": "report generated successfully"
     }
 
+@app.post("/chat")
+async def chat_with_gis_agent(payload: dict):
+    """Continue chatting with GIS Agent (for new Streamlit UI)"""
+    message = payload.get("message", "").strip()
+    thread_id = payload.get("thread_id")
+
+    if not message:
+        raise HTTPException(400, detail="message is required")
+    if not thread_id:
+        raise HTTPException(400, detail="thread_id is required")
+
+    print(f"[Chat Endpoint] Question received → thread_id: {thread_id} | message: {message[:80]}...")
+
+    try:
+        get_model_and_processor() 
+
+        checkpointer = graph.checkpointer
+        current_state = checkpointer.get({"configurable": {"thread_id": thread_id}}) or {}
+
+        report = current_state.get("report_markdown", "") or "No previous report found."
+
+        system_prompt = (
+            "You are a professional GIS analysis assistant with deep expertise in spatial statistics and thematic mapping. "
+            "Answer the user's question based on the provided analysis report. "
+            "Be concise, academic, and helpful."
+        )
+
+        user_prompt = f"""Current Analysis Report:
+        {report}
+
+        User Question: {message}
+
+        Provide a clear, professional response based on the report above."""
+
+        response_text = call_vlm(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_path=None,
+            max_new_tokens=1024
+        )
+
+        print(f"[Chat Endpoint] Reply success, length: {len(response_text)} chars")
+
+        return {"response": response_text}
+
+    except Exception as e:
+        print(f"[Chat Endpoint] Exception: {type(e).__name__} - {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "response": "Sorry, a technical issue occurred while processing your question. Please try again later, or ask a more specific GIS-related question."
+        }
+
 # start app
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

@@ -8,7 +8,6 @@ from fastapi.responses import JSONResponse
 import os
 from pathlib import Path
 import shutil
-import tempfile
 
 app = FastAPI(title="ArcPy GIS Preprocessor & Tool Service")
 
@@ -24,7 +23,7 @@ async def preprocess_gis_file(file: UploadFile = File(...)):
         ext = file.filename.lower()
         metadata = {}
 
-        # 处理 shp 或 zip
+        # Process shp or zip
         if ext.endswith(('.shp', '.zip')):
             if ext.endswith('.zip'):
                 extract_dir = temp_path + "_extracted"
@@ -62,7 +61,7 @@ async def preprocess_gis_file(file: UploadFile = File(...)):
 
 @app.post("/gis/global_morans_i")
 async def global_morans_i(data: dict):
-    """全局 Moran's I """
+    """Global Moran's I"""
     try:
         feature_class = data.get("feature_class")
         value_field = data.get("value_field")
@@ -110,18 +109,18 @@ async def local_morans_i(data: dict):
         arcpy.env.overwriteOutput = True
         arcpy.env.scratchWorkspace = output_dir    
 
-        # 输出要素类名称
+        # Output feature class name
         output_name = f"LocalMorans_{Path(feature_class).stem}"
         output_fc = os.path.join(output_dir, output_name)
 
-        # 可选参数
+        # Optional parameters
         conceptualization = data.get("conceptualization", "INVERSE_DISTANCE")
         standardization = data.get("standardization", "ROW")
         apply_fdr = data.get("apply_fdr", True)
         number_of_permutations = data.get("number_of_permutations", 999)
 
-        print(f"[Local Moran's I] 开始分析 → {feature_class} | 字段: {value_field}")
-        print(f"[Local Moran's I] 输出路径: {output_fc}")
+        print(f"[Local Moran's I] Starting analysis → {feature_class} | Field: {value_field}")
+        print(f"[Local Moran's I] Output path: {output_fc}")
 
         arcpy.stats.ClustersOutliers(
             Input_Feature_Class=feature_class,
@@ -156,7 +155,7 @@ async def local_morans_i(data: dict):
                 "NS": stats["NS"]
             },
             "high_low_outliers_count": high_low_outliers_count,
-            "message": f"✅ 分析完成！发现 {high_low_outliers_count} 个高低/低高异常区域（HL + LH）"
+            "message": f"✅ Analysis complete! Found {high_low_outliers_count} high-low/low-high outlier areas (HL + LH)"
         })
 
     except Exception as e:
@@ -165,15 +164,15 @@ async def local_morans_i(data: dict):
 
 @app.post("/gis/reverse_geocode")
 async def reverse_geocode(data: dict):
-    """对 Local Moran's I 输出图层进行反向地理编码（HH/LL Top 8 + HL/LH 全部 + 完美适配 REV_ 前缀）"""
+    """Reverse geocode Local Moran's I output layer (HH/LL Top 8 + HL/LH all + adapted for REV_ prefix)"""
     try:
         output_fc = data.get("output_feature_class")
-        print(f"[Reverse Geocoding Service] 收到请求 → output_feature_class = {output_fc}")
+        print(f"[Reverse Geocoding Service] Received request → output_feature_class = {output_fc}")
 
         if not output_fc:
             raise HTTPException(400, detail="output_feature_class is required")
 
-        # 自动补全 .shp
+        # Auto-complete .shp extension
         output_fc = str(output_fc).strip()
         if not output_fc.lower().endswith('.shp'):
             shp_candidate = f"{output_fc}.shp"
@@ -181,9 +180,9 @@ async def reverse_geocode(data: dict):
                 output_fc = shp_candidate
 
         if not os.path.exists(output_fc):
-            raise HTTPException(400, detail=f"文件不存在: {output_fc}")
+            raise HTTPException(400, detail=f"File not found: {output_fc}")
 
-        print(f"[Reverse Geocoding Service] ✅ 找到文件: {output_fc}")
+        print(f"[Reverse Geocoding Service] ✅ File found: {output_fc}")
 
         arcpy.env.overwriteOutput = True
         workspace = os.path.abspath("temp_gis")
@@ -191,7 +190,7 @@ async def reverse_geocode(data: dict):
         arcpy.env.workspace = workspace
         arcpy.env.scratchWorkspace = workspace
 
-        # 第一层筛选 + 第二层 Top 8 筛选（保持不变）
+        # First filter + second Top 8 filter (keep unchanged)
         significant_layer = "significant_clusters"
         arcpy.management.MakeFeatureLayer(
             in_features=output_fc,
@@ -200,10 +199,10 @@ async def reverse_geocode(data: dict):
         )
 
         total_significant = int(arcpy.management.GetCount(significant_layer)[0])
-        print(f"[Reverse Geocoding Service] 第一层筛选后共有 {total_significant} 个显著聚类")
+        print(f"[Reverse Geocoding Service] After first filter: {total_significant} significant clusters")
 
         if total_significant == 0:
-            return JSONResponse({"status": "success", "locations": {}, "message": "无显著聚类"})
+            return JSONResponse({"status": "success", "locations": {}, "message": "No significant clusters"})
 
         desc = arcpy.Describe(significant_layer)
         oid_field = desc.OIDFieldName
@@ -226,10 +225,10 @@ async def reverse_geocode(data: dict):
             for _, _, oid in selected:
                 selected_oids.append(oid)
 
-        print(f"[Reverse Geocoding Service] 二次筛选后最终处理 {len(selected_oids)} 个最显著要素")
+        print(f"[Reverse Geocoding Service] After second filter: processing {len(selected_oids)} most significant features")
 
         if not selected_oids:
-            return JSONResponse({"status": "success", "locations": {}, "message": "无显著要素"})
+            return JSONResponse({"status": "success", "locations": {}, "message": "No significant features"})
 
         final_layer = "top_significant"
         oid_list = ",".join(map(str, selected_oids))
@@ -239,7 +238,7 @@ async def reverse_geocode(data: dict):
             where_clause=f"{oid_field} IN ({oid_list})"
         )
 
-        # 执行地理编码
+        # Execute geocoding
         gdb_path = os.path.join(workspace, "reverse_geocode.gdb")
         if not arcpy.Exists(gdb_path):
             arcpy.management.CreateFileGDB(workspace, "reverse_geocode.gdb")
@@ -248,7 +247,7 @@ async def reverse_geocode(data: dict):
         arcpy.management.FeatureToPoint(in_features=final_layer, out_feature_class=centroid_fc, point_location="CENTROID")
 
         reverse_fc = os.path.join(gdb_path, "reverse_geocoded")
-        print(f"[Reverse Geocoding Service] 开始执行 ReverseGeocode（{len(selected_oids)} 个点）...")
+        print(f"[Reverse Geocoding Service] Starting ReverseGeocode ({len(selected_oids)} points)...")
         arcpy.geocoding.ReverseGeocode(
             in_features=centroid_fc,
             in_address_locator="https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer",
@@ -257,32 +256,29 @@ async def reverse_geocode(data: dict):
             location_type="ADDRESS_LOCATION"
         )
 
-        # ==================== 关键修复：智能匹配 REV_ 前缀字段 ====================
-        print("[Reverse Geocoding Service] ReverseGeocode 完成，正在读取字段...")
+        print("[Reverse Geocoding Service] ReverseGeocode complete, reading fields...")
         field_list = [f.name for f in arcpy.ListFields(reverse_fc)]
-        print(f"[Reverse Geocoding Service] 输出字段列表: {field_list}")
+        print(f"[Reverse Geocoding Service] Output field list: {field_list}")
 
-        # 更智能的字段匹配（优先 REV_ 开头的地址字段）
+        # field matching
         address_field = None
         for f in field_list:
             if f in ["REV_Match_addr", "REV_LongLabel", "REV_ShortLabel", "Match_addr", "LongLabel", "ShortLabel"]:
                 address_field = f
-                print(f"[Reverse Geocoding Service] ✅ 找到地址字段: {address_field}")
                 break
 
-        # 如果还是没找到，尝试任何包含 "addr" 或 "label" 的字段
+        # If still not found, try any field containing "addr" or "label"
         if not address_field:
             for f in field_list:
                 if "addr" in f.lower() or "label" in f.lower():
                     address_field = f
-                    print(f"[Reverse Geocoding Service] ✅ 找到备选地址字段: {address_field}")
                     break
 
         if not address_field:
-            print("[Reverse Geocoding Service] ⚠️ 仍未找到地址字段，使用坐标兜底")
+            print("[Reverse Geocoding Service] ⚠️ Address field still not found, using coordinates as fallback location for all clusters")
             address_field = None
 
-        # 读取结果
+        # Read results
         locations = {"HH": [], "LL": [], "HL": [], "LH": []}
         cursor_fields = ["COType"]
         if address_field:
@@ -291,7 +287,7 @@ async def reverse_geocode(data: dict):
         with arcpy.da.SearchCursor(reverse_fc, cursor_fields) as cursor:
             for row in cursor:
                 cotype = row[0]
-                address = row[1] if address_field and len(row) > 1 else "未知位置"
+                address = row[1] if address_field and len(row) > 1 else "Unknown location"
                 if cotype in locations:
                     locations[cotype].append(address)
 
@@ -301,14 +297,14 @@ async def reverse_geocode(data: dict):
         geocoded_info = {
             "status": "success",
             "locations": locations,
-            "message": f"已成功获取 {len(selected_oids)} 个最显著聚类位置的地名"
+            "message": f"Successfully retrieved location names for {len(selected_oids)} most significant clusters"
         }
 
-        print(f"[Reverse Geocoding Service] 完成 → {locations}")
+        print(f"[Reverse Geocoding Service] Complete → {locations}")
         return JSONResponse(geocoded_info)
 
     except Exception as e:
-        print(f"[Reverse Geocoding Service] 未知错误: {str(e)}")
+        print(f"[Reverse Geocoding Service] Unknown error: {str(e)}")
         raise HTTPException(500, detail=f"Reverse Geocoding failed: {str(e)}")
 
 if __name__ == "__main__":

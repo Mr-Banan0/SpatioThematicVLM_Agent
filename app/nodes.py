@@ -62,7 +62,7 @@ class VisualFeatures(BaseModel):
     main_elements: List[VisualElement] = Field(default_factory=list)
     overall_summary: str = Field(..., description="One-sentence overall visual summary")
     analysis_complete: bool = Field(True, description="Always True, indicating this layer is complete")
-
+ 
 class SemanticThemes(BaseModel):
     main_theme: str = Field(..., description="Main semantic theme")
     spatial_patterns: List[str] = Field(default_factory=list, description="Spatial patterns")
@@ -82,6 +82,7 @@ class AgentState(TypedDict):
     gis_metadata: Dict[str, Any]     
     visual_features: Dict[str, Any]
     semantic_themes: Dict[str, Any]
+    tool_results: Optional[Dict[str, Any]]
     geographic_insights: Dict[str, Any]
     anomalies: List[Dict[str, Any]]
     next: str
@@ -94,7 +95,6 @@ def _extract_and_validate_json(raw_response: str, model_class: type[BaseModel]) 
     print(raw_response[:2000] + "..." if len(raw_response) > 2000 else raw_response)
 
     try:
-        # 清理可能的 markdown 代码块
         cleaned = raw_response.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
@@ -134,12 +134,12 @@ def _extract_and_validate_json(raw_response: str, model_class: type[BaseModel]) 
             # 兜底
             return model_class.model_construct(analysis_complete=True)
 
-
 # ====================== call_vlm======================
 def call_vlm(
     system_prompt: str,
     user_prompt: str,
     image_path: Optional[str] = None,
+    max_new_tokens: int = 512,   # tokens default 512
 ) -> str:
     """Call Qwen2.5-VL with timing and debug prints."""
     start_time = time.time()
@@ -175,7 +175,7 @@ def call_vlm(
 
     generated_ids = model.generate(
         **inputs,
-        max_new_tokens=512,
+        max_new_tokens=max_new_tokens,
         temperature=0.6,
         do_sample=True,
         top_p=0.85,
@@ -203,18 +203,23 @@ def supervisor_node(state: AgentState) -> Dict:
     print("=== [Supervisor Node] START ===")
     start = time.time()
 
-    if "raw_gis_path" in state and "map_image" not in state:
+    visual = state.get("visual_features") or {}
+    semantic = state.get("semantic_themes") or {}
+
+    if state.get("shp_zip_path") and state.get("gis_metadata") is None:
         next_node = "gis_preprocessor"
-    elif state.get("report_markdown") or state.get("pdf_path"):
-        next_node = "END"
-    elif not state.get("visual_features", {}).get("analysis_complete", False):
+    elif state.get("visual_features") is None or not visual.get("analysis_complete", False):
         next_node = "visual_agent"
-    elif not state.get("semantic_themes", {}).get("analysis_complete", False):
+    elif state.get("semantic_themes") is None or not semantic.get("analysis_complete", False):
         next_node = "semantic_agent"
-    elif "anomalies" not in state or state.get("anomalies") is None:
+    elif state.get("gis_metadata") is not None and state.get("tool_results") is None:  
+        next_node = "gis_tool_agent"
+    elif state.get("anomalies") is None:
         next_node = "anomaly_agent"
-    else:
+    elif state.get("report_markdown") is None or not state.get("report_markdown"):
         next_node = "report_agent"
+    else:
+        next_node = "END"
 
     state.setdefault("analysis_steps", []).append(
         f"[{datetime.now().strftime('%H:%M:%S')}] Supervisor → {next_node}"
@@ -224,52 +229,69 @@ def supervisor_node(state: AgentState) -> Dict:
     return {"next": next_node, "analysis_steps": state["analysis_steps"]}
 
 def gis_preprocessor_node(state: AgentState) -> Dict:
-    """使用 ArcPy 服务把 tif / shp 转为 PNG + 提取真实 GIS 元数据"""
+    """提取 shp zip 的 GIS 元数据（不再生成 PNG）"""
     print("=== [GIS Preprocessor Node] START ===")
     start = time.time()
 
-    raw_path = state["raw_gis_path"]
-    print(f"正在预处理文件: {raw_path}")
+    raw_path = state.get("shp_zip_path")
+    if not raw_path:
+        raise Exception("No shp_zip_path found in state")
+
+    print(f"正在提取元数据: {raw_path}")
 
     try:
-        files = {"file": open(raw_path, "rb")}
-        resp = requests.post("http://localhost:8002/preprocess", files=files, timeout=90)
+        with open(raw_path, "rb") as file_obj:
+            resp = requests.post(
+                "http://localhost:8002/preprocess",
+                files={"file": file_obj},
+                timeout=60
+            )
         
         print(f"预处理服务返回状态码: {resp.status_code}")
-        print(f"预处理服务返回内容: {resp.text[:800]}...")   # ← 调试用
 
         if resp.status_code != 200:
             raise Exception(f"预处理服务错误: {resp.text}")
 
         data = resp.json()
-
-        # 安全获取 metadata
         metadata = data.get("gis_metadata", {})
-        preview_png = data.get("preview_png")
-
-        if not preview_png:
-            raise Exception("预处理服务未返回 preview_png")
 
         # 更新 state
-        state["map_image"] = preview_png
         state["gis_metadata"] = metadata
 
-        # 安全显示类型
-        file_type = metadata.get("type", "image")   # ← 防止 KeyError
-
         state.setdefault("analysis_steps", []).append(
-            f"[{datetime.now().strftime('%H:%M:%S')}] GIS Preprocessor 完成 (类型: {file_type})"
+            f"[{datetime.now().strftime('%H:%M:%S')}] GIS Metadata extracted (vector, {metadata.get('feature_count', 0)} features)"
         )
 
-        print(f"=== [GIS Preprocessor] FINISH (类型: {file_type}) (took {time.time()-start:.2f}s) ===\n")
+        print(f"=== [GIS Preprocessor] FINISH (took {time.time()-start:.2f}s) ===\n")
         return {
-            "map_image": preview_png,
             "gis_metadata": metadata,
             "analysis_steps": state["analysis_steps"]
         }
 
+    except requests.exceptions.RequestException as e:
+        # ArcPy 服务是可选组件；未启动时降级为仅图片分析，而不是让整个 /analyze 失败。
+        warning_message = (
+            "GIS Preprocessor service unavailable on localhost:8002; "
+            "continuing without shapefile metadata. "
+            "Start `python gis_preprocessor_service.py` in an ArcGIS Pro Python environment "
+            "to enable GIS preprocessing."
+        )
+        print(f"GIS Preprocessor failed: {e}")
+        state.setdefault("analysis_steps", []).append(
+            f"[{datetime.now().strftime('%H:%M:%S')}] GIS preprocessing skipped: service unavailable"
+        )
+        return {
+            "shp_zip_path": None,
+            "gis_metadata": None,
+            "analysis_steps": state["analysis_steps"],
+            "tool_results": {
+                "warning": warning_message,
+                "detail": str(e)
+            }
+        }
+
     except Exception as e:
-        print(f"❌ GIS Preprocessor 失败: {e}")
+        print(f"GIS Preprocessor failed: {e}")
         raise
 
 # ====================== 2. Visual Agent ======================
@@ -369,47 +391,161 @@ def semantic_agent_node(state: AgentState) -> Dict:
         "analysis_steps": state["analysis_steps"]
     }
 
-# ====================== 4. Anomaly Agent ======================
+# ====================== 4. GIS Tool Agent ======================
+def gis_tool_agent_node(state: AgentState) -> Dict:
+    """GIS Tool Agent: 使用 LLM 智能判断字段，并调用 ArcPy 工具（含 Reverse Geocoding）"""
+    print("=== [GIS Tool Agent] START ===")
+    start = time.time()
+
+    if not state.get("shp_zip_path") and not state.get("gis_metadata"):
+        print("No vector data available, skipping GIS tools")
+        tool_results = {"error": "No vector data provided"}
+    else:
+        feature_class = state.get("gis_metadata", {}).get("raw_path") or state.get("shp_zip_path")
+        fields = state.get("gis_metadata", {}).get("fields", [])
+
+        # LLM 智能选择字段
+        visual = state.get("visual_features", {})
+        semantic = state.get("semantic_themes", {})
+
+        system_prompt = (
+            "You are an expert GIS analyst.\n"
+            "Given the map theme and list of fields, return ONLY the name of the SINGLE most suitable numeric field "
+            "for spatial autocorrelation analysis (Moran's I).\n"
+            "Do not return any explanation, only the field name."
+        )
+
+        user_prompt = f"""Map Information:
+            - Title: {visual.get('map_title', 'Unknown')}
+            - Theme: {visual.get('theme', 'Unknown')}
+            - Semantic Theme: {semantic.get('main_theme', 'Unknown')}
+            Available Fields: {fields}
+            Return ONLY the most relevant field name for spatial analysis."""
+
+        try:
+            llm_response = call_vlm(system_prompt, user_prompt).strip()
+            value_field = llm_response.strip().strip('"').strip("'")
+            print(f"✅ LLM 推荐字段: {value_field}")
+        except Exception as e:
+            print(f"LLM field selection failed: {e}")
+            value_field = next((f for f in fields if f.lower() not in ["fid", "shape", "id", "objectid", "oid"]), None)
+            if not value_field and fields:
+                value_field = fields[0]
+
+        tool_results = {}
+
+        # Global Moran's I
+        try:
+            resp_global = requests.post(
+                "http://localhost:8002/gis/global_morans_i",
+                json={"feature_class": feature_class, "value_field": value_field},
+                timeout=60
+            )
+            if resp_global.status_code == 200:
+                tool_results["global_morans_i"] = resp_global.json()
+                print("[DEBUG] global_morans_i 返回内容：", json.dumps(resp_global.json(), ensure_ascii=False, indent=2))
+            else:
+                tool_results["global_morans_i"] = {"error": resp_global.text}
+        except Exception as e:
+            tool_results["global_morans_i"] = {"error": str(e)}
+
+        # Local Moran's I
+        try:
+            resp_local = requests.post(
+                "http://localhost:8002/gis/local_morans_i",
+                json={"feature_class": feature_class, "value_field": value_field},
+                timeout=60
+            )
+            if resp_local.status_code == 200:
+                tool_results["local_morans_i"] = resp_local.json()
+                print("[DEBUG] local_morans_i 返回内容：", json.dumps(resp_local.json(), ensure_ascii=False, indent=2))
+            else:
+                tool_results["local_morans_i"] = {"error": resp_local.text}
+        except Exception as e:
+            tool_results["local_morans_i"] = {"error": str(e)}
+
+        # ==================== 新增：调用 Reverse Geocoding 服务 ====================
+        geocoded_info = {"status": "failed", "locations": {}, "message": "未执行"}
+        if tool_results.get("local_morans_i") and "output_feature_class" in tool_results["local_morans_i"]:
+            try:
+                output_fc = tool_results["local_morans_i"]["output_feature_class"]
+                resp_geo = requests.post(
+                    "http://localhost:8002/gis/reverse_geocode",
+                    json={"output_feature_class": output_fc},
+                    timeout=60
+                )
+                if resp_geo.status_code == 200:
+                    geocoded_info = resp_geo.json()
+                    print(f"[Reverse Geocoding] 服务调用成功 → {geocoded_info.get('locations', {})}")
+                else:
+                    geocoded_info["message"] = resp_geo.text
+            except Exception as e:
+                geocoded_info["message"] = str(e)
+                print(f"[Reverse Geocoding] 服务调用失败: {e}")
+
+        tool_results["geocoded_locations"] = geocoded_info
+
+    # 统一更新 analysis_steps
+    state.setdefault("analysis_steps", []).append(
+        f"[{datetime.now().strftime('%H:%M:%S')}] GIS Tool Agent completed (Global + Local Moran + Reverse Geocoding)"
+    )
+
+    print(f"=== [GIS Tool Agent] FINISH (took {time.time()-start:.2f}s) ===\n")
+    return {
+        "tool_results": tool_results,
+        "analysis_steps": state["analysis_steps"]
+    }
+
+# ====================== 5. Anomaly Agent ======================
 def anomaly_agent_node(state: AgentState) -> Dict:
     print("=== [Anomaly Agent] START ===")
     start = time.time()
 
-    schema_str = json.dumps(
-        Anomaly.model_json_schema(),
-        ensure_ascii=False,
-        indent=2
-    )
+    tool_results = state.get("tool_results", {})
+    anomalies = []
 
-    system_prompt = (
-        "You are a spatial anomaly detection expert (Layer 3).\n"
-        f"Return a JSON array of objects following this schema:\n{schema_str}\n"
-        "If no anomalies are found, return an empty array: [].\n\n"
-        "CRITICAL RULES:\n"
-        "1. Return ONLY valid JSON, nothing else — no explanations, no markdown, no ```json, no extra text.\n"
-        "2. Each object in the array must strictly follow the schema.\n"
-        "3. Keep all description fields short and concise (max 15 words).\n"
-        "4. Output must be a valid JSON array that can be parsed immediately."
-    )
+    # Global Moran's I
+    if tool_results.get("global_morans_i"):
+        g = tool_results["global_morans_i"]
+        z_score = g.get("z_score", 0)
+        try:
+            z_score = float(g.get("z_score", 0))
+        except (ValueError, TypeError):
+            z_score = 0.0
+        if abs(z_score) > 1.96:
+            anomalies.append({
+                "type": "Global Clustering",
+                "description": f"Significant global spatial autocorrelation detected (Moran's I Z-score = {z_score:.3f}, p-value ≈ {g.get('p_value', 0)})",
+                "location": "Entire map",
+                "severity": "high" if abs(z_score) > 2.58 else "medium"
+            })
 
-    user_prompt = (
-        f"Visual features:\n{json.dumps(state.get('visual_features', {}), ensure_ascii=False)}\n\n"
-        f"Semantic themes:\n{json.dumps(state.get('semantic_themes', {}), ensure_ascii=False)}\n\n"
-        "Detect and list all spatial anomalies."
-    )
+    # Local Moran's I + Geocoded locations（为 report 提供更丰富的信息）
+    if tool_results.get("local_morans_i"):
+        geocoded = tool_results.get("geocoded_locations", {}).get("locations", {})
+        desc = "Local Moran's I identified statistically significant hot spots (HH) and cold spots (LL)"
+        if geocoded.get("HH") or geocoded.get("LL"):
+            desc += f". Notable clusters were detected near: {', '.join(geocoded.get('HH', [])[:2] + geocoded.get('LL', [])[:2])}"
+        
+        anomalies.append({
+            "type": "Local Clusters",
+            "description": desc,
+            "location": "Multiple local clusters",
+            "severity": "medium"
+        })
 
-    response = call_vlm(system_prompt, user_prompt, state["map_image"])
-
-    try:
-        anomalies_list = json.loads(response)
-        if not isinstance(anomalies_list, list):
-            anomalies_list = [anomalies_list] if anomalies_list else []
-        anomalies = [Anomaly.model_validate(item).model_dump() for item in anomalies_list]
-    except Exception:
-        anomalies = []
+    # Visual fallback（保持不变）
+    if not anomalies and state.get("visual_features"):
+        anomalies.append({
+            "type": "Visual Anomaly",
+            "description": "Potential visual anomalies detected in color distribution",
+            "location": "Unknown",
+            "severity": "low"
+        })
 
     state["anomalies"] = anomalies
     state.setdefault("analysis_steps", []).append(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Anomalies detected (Pydantic)"
+        f"[{datetime.now().strftime('%H:%M:%S')}] Anomaly Agent used GIS Tool results"
     )
 
     print(f"=== [Anomaly Agent] FINISH (found {len(anomalies)} anomalies) ===\n")
@@ -418,99 +554,74 @@ def anomaly_agent_node(state: AgentState) -> Dict:
         "analysis_steps": state["analysis_steps"]
     }
 
-# ====================== 5. Report Generator Agent ======================
+# ====================== 6. Report Generator Agent ======================
 def report_agent_node(state: AgentState) -> Dict:
-    """Generate a professional, comprehensive geographic analysis report in Markdown format.
-    Optimized with dynamic fallback that works for any thematic map."""
+    """Generate a professional, comprehensive geographic analysis report in Markdown format."""
     print("=== [Report Agent] START ===")
     start = time.time()
 
-    # Extract results from previous agents
     visual = state.get("visual_features", {})
     semantic = state.get("semantic_themes", {})
     anomalies = state.get("anomalies", [])
+    tool_results = state.get("tool_results", {})
+    geocoded = tool_results.get("geocoded_locations", {}).get("locations", {})
 
     shp_info = ""
     if state.get("gis_metadata"):
         shp_info = f"\nAdditional GIS Data from Shapefile:\n{json.dumps(state['gis_metadata'], ensure_ascii=False, indent=2)}"
-    # ==================== Optimized System Prompt ====================
+
+    # ==================== System Prompt ====================
     system_prompt = (
-        "You are a senior geographic information scientist and environmental analyst.\n"
-        "Write a professional, comprehensive, and well-structured geographic analysis report.\n"
+        "You are a senior geographic information scientist and environmental acoustics expert. "
+        "Write a highly professional, academically rigorous, and well-structured geographic analysis report in Markdown. "
         "Requirements:\n"
-        "1. Use formal academic tone with natural paragraphs and smooth transitions.\n"
-        "2. Strictly use Markdown format with clear headings (#, ##, ###).\n"
-        "3. Focus on geographic significance, spatial patterns, and environmental insights.\n"
-        "4. Do NOT output any JSON, code blocks, or explanatory text — only the final report.\n"
-        "5. Keep the report in-depth but concise."
+        "1. MUST output the COMPLETE report without any truncation.\n"
+        "2. Use formal academic tone with precise geospatial terminology and smooth transitions.\n"
+        "3. Strictly follow the exact section structure requested.\n"
+        "4. In the Anomaly Analysis section, first briefly describe global clustering with Z-score, "
+        "then focus on local clusters and seamlessly integrate the real geocoded location names into the analysis.\n"
+        "5. Do NOT create separate subsections for Real Location References — weave them naturally into the Local Clusters discussion.\n"
+        "6. Do NOT output JSON, code, or explanations — only the pure Markdown report."
     )
 
     # ==================== User Prompt ====================
-    user_prompt = f"""Analyze the following analysis results and generate a complete geographic analysis report.{shp_info}
-    Visual Features:
-    {json.dumps(visual, ensure_ascii=False, indent=2)}
+    user_prompt = f"""Analyze the following analysis results and generate a COMPLETE, professional geographic analysis report.
 
-    Semantic Themes:
-    {json.dumps(semantic, ensure_ascii=False, indent=2)}
+Visual Features:
+{json.dumps(visual, ensure_ascii=False, indent=2)}
 
-    Detected Anomalies:
-    {json.dumps(anomalies, ensure_ascii=False, indent=2)}
+Semantic Themes:
+{json.dumps(semantic, ensure_ascii=False, indent=2)}
 
-    Please generate a well-structured Markdown report that includes the following sections:
-    - Main Title (using #)
-    - Executive Summary
-    - Visual Interpretation
-    - Spatial Patterns and Geographic Significance
-    - Key Insights and Implications
-    - Anomaly Analysis (if any)
-    - Conclusion and Recommendations
+Anomalies (from Anomaly Agent):
+{json.dumps(anomalies, ensure_ascii=False, indent=2)}
 
-    Use professional yet readable language. Emphasize geographic meaning and environmental implications."""
+Geocoded Real Locations (请自然融入 Anomaly Analysis 的 Local Clusters 部分，进行详细空间解读):
+{json.dumps(geocoded, ensure_ascii=False, indent=2)}
 
-    # Call VLM to generate the report
-    markdown = call_vlm(system_prompt, user_prompt, state.get("map_image"))
+{shp_info}
 
-    # ==================== Fallback ====================
-    if not markdown or len(markdown.strip()) < 100:
-        # Try to extract useful information dynamically
-        map_title = visual.get("map_title") or visual.get("theme") or "Thematic Map"
-        main_theme = semantic.get("main_theme") or "Geographic Analysis"
-        geo_meaning = semantic.get("geographic_meaning") or "Spatial patterns and environmental insights are presented."
+Please generate a well-structured Markdown report with these exact sections:
 
-        markdown = f"""# {map_title} Analysis Report
-        **Generation Time**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        **Analysis Model**: Qwen2.5-VL-7B
+- Main Title (using #)
+- Executive Summary
+- Visual Interpretation
+- Spatial Patterns and Geographic Significance
+- Key Insights and Implications
+- Anomaly Analysis （先简要说明 Global Clustering 并量化 Z-score，然后重点分析 Local Clusters，并自然融入真实地名进行详细解读）
+- Conclusion and Recommendations
 
-        ## Executive Summary
-        This thematic map presents {main_theme.lower()}. The analysis reveals important spatial patterns and geographic significance.
+Use formal academic language. Emphasize geographic significance, environmental implications, and policy relevance. Make the report concise yet in-depth."""
 
-        ## Visual Interpretation
-        {visual.get('overall_summary', 'No visual summary available.')}
-
-        ## Spatial Patterns and Geographic Significance
-        {main_theme}  
-        {geo_meaning}
-
-        ## Key Insights
-        {chr(10).join(['- ' + insight for insight in semantic.get('key_insights', [])]) or 'No additional insights identified.'}
-
-        ## Anomaly Analysis
-        {"No significant spatial anomalies were detected." if not anomalies else "The following spatial anomalies were identified:"}
-        {chr(10).join(['- ' + a.get('description', '') for a in anomalies]) if anomalies else ''}
-
-        ## Conclusion and Recommendations
-        The map demonstrates notable geographic characteristics. Further investigation and appropriate measures are recommended based on the identified patterns and anomalies.
-        """
-    # =====================================================================
+    # 调用 VLM
+    markdown = call_vlm(system_prompt, user_prompt, state.get("map_image"), max_new_tokens=2048)
 
     state["report_markdown"] = markdown
-
     state.setdefault("analysis_steps", []).append(
-        f"[{datetime.now().strftime('%H:%M:%S')}] Markdown report generated successfully"
+        f"[{datetime.now().strftime('%H:%M:%S')}] Markdown report generated successfully (Anomaly Analysis optimized)"
     )
 
     print(f"=== [Report Agent] FINISH (took {time.time()-start:.2f}s) ===\n")
-
     return {
         "report_markdown": markdown,
         "pdf_path": None,
